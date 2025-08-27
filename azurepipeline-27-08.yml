@@ -1,0 +1,161 @@
+# Azure DevOps CI/CD with Blue/Green Deployment
+# Flow: Build app → Build & push Docker image → Decide env → Deploy to Blue or Green VM → Flip
+
+trigger:
+- main
+
+resources:
+- repo: self
+
+variables:
+- name: tag
+  value: $(Build.BuildId)
+- name: imageName
+  value: ayat93/nodeapp
+- group: env-config   # contains activeEnv & inactiveEnv
+
+stages:
+# -------- Stage 1: Build Node app --------
+- stage: AppBuild
+  displayName: "Build and Package App"
+  jobs:
+  - job: Build_the_app
+    pool:
+      name: azure   # build agent pool (your build VM)
+    steps:
+    - script: npm ci
+      displayName: "Install dependencies"
+    - script: |
+        npm pack
+        mv *.tgz $(Build.ArtifactStagingDirectory)/app.tgz
+      displayName: "Package app"
+    - publish: $(Build.ArtifactStagingDirectory)/app.tgz
+      artifact: app-package
+      displayName: "Publish app.tgz"
+
+# -------- Stage 2: Build & push Docker image --------
+- stage: DockerImageBuild
+  displayName: "Build Docker image"
+  dependsOn: AppBuild
+  jobs:
+  - job: Docker_Image
+    pool:
+      name: azure   # build agent pool
+    steps:
+    - download: current
+      artifact: app-package
+      displayName: "Download app artifact"
+    - task: Docker@2
+      displayName: Build and Push Docker image to Docker Hub
+      inputs:
+        command: buildAndPush
+        containerRegistry: 'dockerhub'      # your Docker Hub service connection
+        dockerfile: '$(Build.SourcesDirectory)/Dockerfile'
+        buildContext: '$(Pipeline.Workspace)/app-package'
+        repository: 'ayat93/nodeapp'
+        tags: $(tag)
+
+# -------- Stage 3: Decide target env --------
+- stage: DecideEnv
+  displayName: "Decide Deployment Target"
+  dependsOn: DockerImageBuild
+  jobs:
+  - job: Decide
+    pool:
+      name: azure
+    steps:
+    - script: |
+        echo "Currently active: $(activeEnv)"
+        if [ "$(activeEnv)" = "blue" ]; then
+          echo "##vso[task.setvariable variable=deployTarget;isOutput=true]green"
+          echo "##vso[task.setvariable variable=newActiveEnv;isOutput=true]green"
+          echo "##vso[task.setvariable variable=newInactiveEnv;isOutput=true]blue"
+        else
+          echo "##vso[task.setvariable variable=deployTarget;isOutput=true]blue"
+          echo "##vso[task.setvariable variable=newActiveEnv;isOutput=true]blue"
+          echo "##vso[task.setvariable variable=newInactiveEnv;isOutput=true]green"
+        fi
+      name: decideScript
+      displayName: "Decide inactive environment"
+
+# -------- Stage 4: Deploy (Blue VM / Green VM) --------
+- stage: Deploy
+  displayName: "Deploy to inactive environment"
+  dependsOn: DecideEnv
+  variables:
+    deployTarget: $[ stageDependencies.DecideEnv.Decide.outputs['decideScript.deployTarget'] ]
+    newActiveEnv: $[ stageDependencies.DecideEnv.Decide.outputs['decideScript.newActiveEnv'] ]
+    newInactiveEnv: $[ stageDependencies.DecideEnv.Decide.outputs['decideScript.newInactiveEnv'] ]
+  jobs:
+  - job: DeployBlue
+    displayName: "Deploy to Blue VM"
+    pool:
+      name: blue   # Blue VM agent pool
+    condition: eq(variables['deployTarget'], 'blue')
+    steps:
+    - script: |
+        echo "Deploying to BLUE VM"
+        echo "Stopping old container if running..."
+        docker rm -f nodeapp-blue || true
+        echo "Pulling latest image..."
+        docker pull $(imageName):$(tag)
+        echo "Starting container on port 80..."
+        docker run -d -p 80:3000 --name nodeapp-blue $(imageName):$(tag)
+      displayName: "Deploy container on Blue VM"
+
+  - job: DeployGreen
+    displayName: "Deploy to Green VM"
+    pool:
+      name: green   # Green VM agent pool
+    condition: eq(variables['deployTarget'], 'green')
+    steps:
+    - script: |
+        echo "Deploying to GREEN VM"
+        echo "Stopping old container if running..."
+        docker rm -f nodeapp-green || true
+        echo "Pulling latest image..."
+        docker pull $(imageName):$(tag)
+        echo "Starting container on port 80..."
+        docker run -d -p 80:3000 --name nodeapp-green $(imageName):$(tag)
+      displayName: "Deploy container on Green VM"
+
+# -------- Stage 5: Flip env state --------
+- stage: FlipEnv
+  displayName: "Flip Environment After Success"
+  dependsOn: DecideEnv
+  condition: succeeded()
+  variables:
+    # ✅ explicitly pull values from DecideEnv job outputs
+    newActiveEnv: $[ stageDependencies.DecideEnv.Decide.outputs['decideScript.newActiveEnv'] ]
+    newInactiveEnv: $[ stageDependencies.DecideEnv.Decide.outputs['decideScript.newInactiveEnv'] ]
+  jobs:
+  - job: UpdateVars
+    pool:
+      name: azure   # run update on build VM
+    steps:
+    - script: |
+        echo "DEBUG >>> Raw value of newActiveEnv = '$(newActiveEnv)'"
+        echo "DEBUG >>> Raw value of newInactiveEnv = '$(newInactiveEnv)'"
+
+        if [ -z "$(newActiveEnv)" ] || [ -z "$(newInactiveEnv)" ]; then
+          echo "❌ ERROR: Variables are empty. Check DecideEnv outputs."
+          exit 1
+        fi
+
+        # Ensure Azure CLI
+        if ! command -v az &> /dev/null; then
+          curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+          sudo apt-get install -y azure-cli
+        fi
+
+        az extension add --name azure-devops
+        az devops configure --defaults organization=https://dev.azure.com/pustbootcamp project=nodeapp
+
+        groupId=$(az pipelines variable-group list --query "[?name=='env-config'].id" -o tsv)
+
+        echo "Updating variable group..."
+        az pipelines variable-group variable update --group-id $groupId --name activeEnv --value "$(newActiveEnv)"
+        az pipelines variable-group variable update --group-id $groupId --name inactiveEnv --value "$(newInactiveEnv)"
+      env:
+        AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)
+      displayName: "Update variable group with new env"
