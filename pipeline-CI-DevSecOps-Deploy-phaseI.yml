@@ -83,7 +83,7 @@ stages:
       displayName: "Trivy Image scan (cached)"
 
     # 4. Publish Trivy image report
-    - publish: /tmp/trivy-report-dockerImage.json
+    - publish: $(Build.SourcesDirectory)/trivy-report-dockerImage.json
       artifact: trivy-report-dockerImage
       displayName: "Publish Trivy Report for the docker image"
 - stage: Deploy
@@ -100,4 +100,5 @@ stages:
 
         echo "Starting new container..."
         docker run -d -p 80:3000 --name nodeapp $(imageName):$(tag)
+
       displayName: "Deploy container on same VM"
